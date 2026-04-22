@@ -10,27 +10,23 @@
 
 ---
 
-## 用户画像
+## Memory 内容边界
 
-| 文件 | 说明 |
-|------|------|
-| `user-profile.md` | 我是谁、我怎么说话、默认策略偏好（**始终加载**） |
+Memory 文件（`user-profile.md` / `persons/*.md` / `groups/*.md`）的**正文**只写**自然语言描述**——我是谁、某人什么风格、这个群什么氛围。
 
----
+**技术 ID（`lark_user_id` / `chat_id` / `app_id`）不进正文**，只作为结构化元数据进 **frontmatter**（见 templates/），或编码在文件名里。正文是供人读、供 Agent 理解语境的；ID 是路由用的机器字段。
 
-## 人物档案
-
-| 姓名 | 文件 | lark_user_id | 最近更新 | 备注 |
-|------|------|--------------|----------|------|
-| _(使用中逐步累积)_ | | | | |
+**当前用户自己的身份不持久化**——运行时查 `lark-cli auth status --format json` 拿 `userOpenId`（详见 cookbook "查当前用户身份"）。不把 ou_id / app_id 写进 `user-profile.md`。
 
 ---
 
-## 群组上下文
+## 运行时路由（不维护集中索引）
 
-| 群名 | 文件 | chat_id | 最近更新 | 备注 |
-|------|------|---------|----------|------|
-| _(使用中逐步累积)_ | | | | |
+Skill 需要定位某条消息对应的 person/group 文件时：
+- **按 sender 的 `lark_user_id` 查人物** → `glob persons/*.md` → 读每个文件 frontmatter 的 `lark_user_id` 字段匹配
+- **按 chat_id 查群** → `glob groups/*.md` → 读 frontmatter 的 `chat_id` 字段匹配
+
+不维护一个集中的路由表（容易跟实际文件漂移）。索引即文件 frontmatter。
 
 ---
 

@@ -1,0 +1,8 @@
+# Claude Code per-machine state
+.claude/settings.local.json
+
+# Runtime memory — 每人本地累积，不入仓库
+# 只跟踪 templates/ 和 index.md（设计文档），runtime 文件按需在本地生成
+skills/shared/memory/user-profile.md
+skills/shared/memory/persons/
+skills/shared/memory/groups/

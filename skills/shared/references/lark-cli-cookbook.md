@@ -36,6 +36,15 @@ lark-cli auth list       # 所有已登录账号
 lark-cli auth logout     # 登出
 ```
 
+### 查当前用户身份（"我是谁"）
+
+运行时拿当前登录用户的 `lark_user_id`（open_id），用于过滤 "@ 我" / "我发的消息"：
+```bash
+lark-cli auth status --format json | jq -r '.userOpenId'
+# 也可以一次拿全：jq '{name:.userName, open_id:.userOpenId, app_id:.appId}'
+```
+**不要把 ou_id 持久化到 memory markdown 里。** memory 正文只写自然语言描述，ID 运行时查 CLI。
+
 ### 身份切换（用户 vs 机器人）
 不用 subcommand 切换，而是在命令上加 `--as`：
 ```bash
@@ -103,26 +112,74 @@ lark-cli im +messages-send --chat-id "oc_xxx" --text "hi" --dry-run
 
 **拉某 chat 的历史消息**（支持时间范围、排序、分页）
 ```bash
-lark-cli im +chat-messages-list --chat-id "<oc_xxx>" --format json
-# 首次用：lark-cli im +chat-messages-list --help 确认完整 flag
+lark-cli im +chat-messages-list --chat-id "<oc_xxx>" \
+  --page-size 50 --sort desc --format json
+# 可选：--start / --end（ISO 8601） / --page-token
+# 也可用 --user-id "<ou_xxx>" 拉 P2P（与 --chat-id 互斥）
 ```
 
 **跨聊天搜消息**（关键词 / sender / 时间范围）
 ```bash
 lark-cli im +messages-search --keyword "<关键词>" --format json
 # 可选：--sender <user_id>, --chat-id <chat_id>
-# 首次用：lark-cli im +messages-search --help
+# 首次用：lark-cli im +messages-search --help（flag 名未实测）
 ```
 
 **批量取多条消息详情**
 ```bash
-lark-cli im +messages-mget --message-ids "<mid1>,<mid2>,..." --format json
+lark-cli im +messages-mget --message-ids "om_xxx,om_yyy" --format json
+# 上限 50 个 message_id；自动做 sender 名字补全；自动展开 thread replies
 ```
 
 **获取单条消息详情**（若 mget 单条不适合，走 raw API）
 ```bash
 lark-cli api GET /open-apis/im/v1/messages/<message_id> --format json
 ```
+
+### 消息上下文补全（hydration）
+
+消息上下文常常**跨窗口**——仅凭 `+chat-messages-list` 返回的最近 N 条不够，需要额外拉 3 种东西才能还原完整语境。分析前必须 hydrate，不要在半残信息上做推断。
+
+**什么时候要 hydrate：**
+| 触发条件 | 要拉什么 | 用哪个命令 |
+|---|---|---|
+| 消息 `reply_to` 不为空、且目标 `om_xxx` 不在当前窗口 | 拉这条被回复的原消息（递归 follow 直到链首） | `+messages-mget` |
+| 消息带 `thread_id` 或 `msg_type: merge_forward` | 拉整个 thread 的所有消息 | `+threads-messages-list` |
+| `msg_type: image / file / audio / media` 且上下文需要"对方发了什么" | 下载资源到本地 → 让 Claude 直接 Read（图片走视觉，文件按扩展名处理） | `+messages-resources-download` |
+
+**#1 还原 reply_to 链**
+```bash
+# 目标：对消息 M 做分析前，把 M.reply_to → P, P.reply_to → PP, ... 全拉出来
+lark-cli im +messages-mget --message-ids "<om_parent>[,<om_grandparent>,...]" --format json
+# 策略：批量一次最多 50 个 id；递归 follow 时注意去重、记录链序
+```
+
+**#2 展开 thread**
+```bash
+# --thread 接 om_xxx 或 omt_xxx 都行，CLI 会解析成 thread_id
+lark-cli im +threads-messages-list --thread "<om_xxx 或 omt_xxx>" \
+  --sort asc --page-size 500 --format json
+```
+
+**#3 下载图片/文件**
+```bash
+# content 字段里的占位符 "[Image: img_v3_xxx]" 里那串就是 file-key
+lark-cli im +messages-resources-download \
+  --message-id "<om_xxx>" \
+  --file-key "<img_v3_xxx 或 file_xxx>" \
+  --type image \
+  --output "/tmp/anti-olden/<om_xxx>-<key>.jpg"
+# --output 限相对路径且不能有 .. ——但可以给 /tmp 下的绝对路径吗？实测时验证
+# 下载后：图片用 Read 工具直接加载（Claude 有视觉），文件按扩展名处理
+```
+
+**实战顺序（reply-coach Step 2 流程）：**
+1. `+chat-messages-list` 拉近 20-30 条
+2. 扫一遍：找出有 `reply_to` 但父消息不在窗口的 → 收集 `om_id`
+3. 找出有 `thread_id` 的 → 标记
+4. 找出 `msg_type != text` 的媒体消息 → 标记
+5. 一次 `+messages-mget` 批量拉 reply 父消息；对每个 thread 调 `+threads-messages-list`；对目标上下文里的媒体调 `+messages-resources-download`
+6. 把 hydrate 后的完整消息树扁平化成时间轴喂给分析 prompt
 
 ### 消息写入
 
