@@ -1,6 +1,7 @@
 ---
 name: reply-coach
 description: 帮用户在飞书/Lark 起草高情绪成本消息的回复——分析对方意图、加载人物档案和群组上下文、按三种策略（柔和推进 / 就事论事 / 强势推回）提供回复建议。触发场景：用户提到飞书/Lark/@我/群聊/回复、说"这条不好回"/"帮我想想怎么说"/"这消息怎么处理"、或讨论跟某位同事的沟通策略。依赖 Lark CLI（`lark-cli`）。
+allowed-tools: Bash Read AskUserQuestion WebSearch
 ---
 
 # 回复参谋
@@ -83,6 +84,8 @@ Bash 调 `lark-cli`。命令查 `../shared/references/lark-cli-cookbook.md`。
 ```
 
 **Memory 存在时**，直接读入，不重复问。但如果消息内容和 Memory 记录明显冲突（比如档案说"此人 ego 高"，但这次他很客气），指出冲突让用户判断。
+
+**读 memory 按语义提取，不要按固定 section 名抓取。** 每份档案的 section 结构可能不同——可能有 `## 沟通风格` / `## 雷区`，也可能有 `## 权力逻辑` / `## 兴趣点` 这类自定义 section。档案里**有什么用什么**；档案里没讲某个维度就承认"这个维度档案没记录"，不要强行从临近 section 里猜。
 
 ### Step 4: 分析消息
 

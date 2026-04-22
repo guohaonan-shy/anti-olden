@@ -18,6 +18,8 @@ Memory 文件（`user-profile.md` / `persons/*.md` / `groups/*.md`）的**正文
 
 **当前用户自己的身份不持久化**——运行时查 `lark-cli auth status --format json` 拿 `userOpenId`（详见 cookbook "查当前用户身份"）。不把 ou_id / app_id 写进 `user-profile.md`。
 
+**正文 section 自由，frontmatter 字段固定。** Template 里列的 `## 沟通风格` / `## 群氛围` 等是**参考骨架，不是 schema**——每份档案可以按对方/该群的真实特点增删改 section（老板档案 vs 同事 vs 朋友 section 应不同）。AI 不要为"符合模板"强行填空或漏填；也不要在已有档案里乱改 section 结构——**沿用该文件既有的 section**，新观察无处可落就新开一个 section 跟用户确认。只有 frontmatter 机器字段（`lark_user_id` / `chat_id` / `last_processed_*` / `last_updated`）是必守的。
+
 ---
 
 ## 运行时路由（不维护集中索引）
@@ -27,6 +29,54 @@ Skill 需要定位某条消息对应的 person/group 文件时：
 - **按 chat_id 查群** → `glob groups/*.md` → 读 frontmatter 的 `chat_id` 字段匹配
 
 不维护一个集中的路由表（容易跟实际文件漂移）。索引即文件 frontmatter。
+
+---
+
+## 所有 memory 写入的通用规则（**不要跳**）
+
+无论是 comm-brief 的消息驱动沉淀、还是 comm-memory 的用户驱动 CRUD，**写入前必须**：
+
+1. **整理拟写入 diff**（整段或整块增量）
+2. **展示 diff 给用户**（格式化清晰，原样贴）
+3. **调 `AskUserQuestion` 工具**（不是文本问）给 4 个选项：
+   - **A. 写入** —— 按 diff 落
+   - **B. 只更 checkpoint** —— 仅 comm-brief 群档案相关时有此选项；跳过内容，只 bump 时间戳 / message_id
+   - **C. 让我改一下** —— 用户口头说怎么改 → AI 按修改重新算 diff → 回到第 2 步再展示 → 再问 —— **循环直到 A 或 D**
+   - **D. 不写** —— 跳过
+4. **选 C 必须循环**：改几次都要重新展示 + 重新问。不能改完就静默写。
+
+memory 是 AI + 用户共同作者的产物；用户必须有"我说了算 + 我能改"的纠偏权。
+
+---
+
+## 谁写什么（写权限边界）
+
+**驱动源不同**：
+- **comm-brief = 消息驱动**：从 `lark-cli` 拉到的消息里提炼观察 → 候选写入。主业之一就是沉淀到 memory
+- **comm-memory = 用户驱动**：完全依赖用户口述。**不拉消息**，复合意图（如"基于最近聊天给 X 建档"）→ 建议用户先跑 `/comm-brief`
+
+| 写入目标 | reply-coach | comm-brief（消息驱动） | comm-memory（用户驱动） |
+|---|---|---|---|
+| `user-profile.md`（正文） | ❌ | ❌（"我"不该从群聊反向推） | ✅ |
+| `persons/*.md`（正文 + frontmatter） | ❌ | ✅（消息里观察到的人物特征 / 互动模式） | ✅ |
+| `groups/*.md` → `群氛围` / `关键人物` / `注意事项` | ❌ | ✅（从消息观察） | ✅ |
+| `groups/*.md` → `话题基线` / `近期简报` | ❌ | ✅（冷启动建基线、增量加条目） | ✅ |
+| `groups/*.md` → frontmatter checkpoint 字段 | ❌ | ✅（自动 bump） | ✅ |
+
+**所有写入都受上面"通用规则"约束**——经用户 ABCD 选 A 才写，选 C 要循环改。
+
+为什么 comm-brief 也能写人档案？因为群聊本身就是观察人的主要场。"张三这两周在 X 群密集吐槽 Y" 这种观察直接写到 `persons/zhang-san.md` 的某个段更自然，而不是让用户事后用 comm-memory 口头再报告一遍。
+
+---
+
+## 群档案 checkpoint 字段
+
+`groups/*.md` frontmatter 两个机器字段，由 comm-brief 增量模式消费和更新：
+
+- `last_processed_at: 2026-04-22T14:50:00+08:00` — 上次处理到的消息时间（CLI `--start` 参数）
+- `last_processed_message_id: om_xxxxxxx` — 上次处理到的具体消息 ID（防同秒重复 / 精确锚点）
+
+冷启动触发条件：无档案 / 字段缺失 / `last_processed_at` 距今 > 30 天。冷启动默认拉近 **14 天**。
 
 ---
 
@@ -46,7 +96,7 @@ Skill 需要定位某条消息对应的 person/group 文件时：
 ## 检索顺序
 
 处理一条消息时：
-1. **始终加载** `user-profile.md`
-2. 如消息来自某个群 → 按 `chat_id` 在群组表查 → 加载 `groups/{file}.md`；没有则用 `templates/group-profile.md` 新建
-3. 按对方 `lark_user_id` 在人物表查 → 加载 `persons/{file}.md`；没有则用 `templates/person-profile.md` 新建
-4. 新建的文件 → 回来更新本索引对应表
+1. **始终加载** `user-profile.md`（不存在就按 comm-memory 的"首次建档"引导建）
+2. 消息来自某个群 → glob `groups/*.md` → frontmatter 的 `chat_id` 匹配 → 命中就 Read；未命中时不自动建，等用户通过 comm-brief / comm-memory 触发
+3. 按 sender 的 `lark_user_id` → glob `persons/*.md` → frontmatter 的 `lark_user_id` 匹配 → 命中就 Read；未命中同上
+4. 建档基于 `templates/` 作为 schema 参考（只读），Write 到 `groups/` 或 `persons/` 下的新文件——**template 本身永不被覆盖**
