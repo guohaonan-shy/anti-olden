@@ -16,8 +16,8 @@
 
 | 用户说什么 | 路由到 |
 |---|---|
-| "给 Hayden 建档"（只给对象） | comm-brief（会去拉消息分析） |
-| "Hayden 爱引用数据，不喜欢 emoji，给他建档"（口述自足） | comm-memory（直接接口述） |
+| "给 X 建档"（只给对象） | comm-brief（会去拉消息分析） |
+| "X 爱引用数据，不喜欢 emoji，给他建档"（口述自足） | comm-memory（直接接口述） |
 | "xx 群最近啥情况" | comm-brief |
 | "记一下 X 今天配合得好" | comm-memory |
 | "看看 X 档案" | comm-memory（纯读） |

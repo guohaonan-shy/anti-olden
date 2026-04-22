@@ -136,6 +136,43 @@ lark-cli im +messages-mget --message-ids "om_xxx,om_yyy" --format json
 lark-cli api GET /open-apis/im/v1/messages/<message_id> --format json
 ```
 
+### 分页拉取脚手架（窗口内自动翻到底）
+
+活跃群半年窗口可能几千条，50 条/页要翻 30-50 页。写成可复用脚本：
+
+```bash
+cat > /tmp/paginate.sh <<'EOF'
+#!/bin/bash
+# Usage: paginate.sh <chat_id> <label> <start_iso8601> [page_cap]
+CHAT_ID="$1"; LABEL="$2"; START="$3"; CAP="${4:-200}"
+OUTDIR="/tmp/paginate-out"; mkdir -p "$OUTDIR"
+TOKEN=""; PAGE=1
+while :; do
+  if [ -z "$TOKEN" ]; then
+    lark-cli im +chat-messages-list --chat-id "$CHAT_ID" --start "$START" --page-size 50 --sort desc --format json > "$OUTDIR/${LABEL}_page${PAGE}.json"
+  else
+    lark-cli im +chat-messages-list --chat-id "$CHAT_ID" --start "$START" --page-size 50 --sort desc --page-token "$TOKEN" --format json > "$OUTDIR/${LABEL}_page${PAGE}.json"
+  fi
+  HAS_MORE=$(jq -r '.data.has_more' "$OUTDIR/${LABEL}_page${PAGE}.json")
+  TOKEN=$(jq -r '.data.page_token // ""' "$OUTDIR/${LABEL}_page${PAGE}.json")
+  EARLIEST=$(jq -r '.data.messages[-1].create_time // "∅"' "$OUTDIR/${LABEL}_page${PAGE}.json")
+  echo "[$LABEL] page$PAGE earliest=$EARLIEST has_more=$HAS_MORE"
+  if [ "$HAS_MORE" != "true" ] || [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then break; fi
+  PAGE=$((PAGE+1))
+  if [ $PAGE -gt $CAP ]; then echo "[$LABEL] CAP HIT at $CAP"; break; fi
+done
+echo "[$LABEL] DONE. pages=$PAGE"
+EOF
+chmod +x /tmp/paginate.sh
+# 用法：/tmp/paginate.sh "oc_xxx" "mygroup" "2025-11-01T00:00:00+08:00" 100
+```
+
+**`page_cap` 怎么设**（踩过的坑）：
+1. **先 peek 第一页**看 50 条的时间跨度——`latest` 减 `earliest` = 单页覆盖多少小时
+2. **估算**：目标窗口总时长 / 单页跨度 = 需要的页数，再 × 1.5 余量
+3. **活跃群半年可能要 50-200 页**。默认 50 cap 对话唠群是不够的（实测：某高活跃闲聊群 50 页只覆盖 2 个月）
+4. 后台跑：用 `run_in_background=true` 起多个群并行，避免串行等
+
 ### 消息上下文补全（hydration）
 
 消息上下文常常**跨窗口**——仅凭 `+chat-messages-list` 返回的最近 N 条不够，需要额外拉 3 种东西才能还原完整语境。分析前必须 hydrate，不要在半残信息上做推断。
@@ -200,7 +237,21 @@ lark-cli im +messages-reply --message-id "<mid>" --text "<text>" --dry-run
 
 **按群名搜群（找 chat_id）**
 ```bash
-lark-cli im +chat-search --keyword "<群名关键字>" --format json
+lark-cli im +chat-search --query "<群名关键字>" --format json
+# ⚠️ flag 是 --query 不是 --keyword（实测 2026-04-22）。群名模糊匹配靠得住，短词比长词好；注意**空格/连字符敏感**——群名若含空格，搜索词带连字符可能搜不到，先试空格版本
+```
+
+**找"我跟某人都在的群"**（人物建档必需）
+```bash
+lark-cli im +chat-search --member-ids "<ou_target>,<ou_me>" --format json \
+  | jq '.data.chats[] | {chat_id, name}'
+# 返回我和 ou_target 共同在场的所有群
+```
+
+**按姓名搜用户拿 ou_id**
+```bash
+lark-cli contact +search-user --query "<中文名或英文名>" --format json \
+  | jq '.data.users[] | {open_id, name, en_name, department_ids}'
 ```
 
 **联系人操作** — 有专门的 `lark-contact` skill。首次用时查：
@@ -222,6 +273,49 @@ lark-cli api GET /open-apis/contact/v3/users/<user_id> \
   --params '{"user_id_type":"open_id"}' \
   --format json
 ```
+
+### 人物建档：跨群 + DM 聚合（comm-brief 人物路径）
+
+给某人建档时，要把"**我跟他所有共同语境**"聚合起来分析。完整流程：
+
+```bash
+# === Step 0: 拿 ID ===
+MY_OU=$(lark-cli auth status --format json | jq -r '.userOpenId')
+TARGET_OU=$(lark-cli contact +search-user --query "<姓名>" --format json | jq -r '.data.users[0].open_id')
+echo "me=$MY_OU target=$TARGET_OU"
+
+# === Step 1: 找共同群 ===
+lark-cli im +chat-search --member-ids "$TARGET_OU,$MY_OU" --format json \
+  | jq -r '.data.chats[] | "\(.chat_id) \(.name)"'
+# → 输出共同群列表，跟用户确认挑哪几个群作为分析范围
+
+# === Step 2: 每个共同群分页拉（起 background，并行）===
+# 用 /tmp/paginate.sh <chat_id> <label> "2025-11-01T00:00:00+08:00" 200
+# 起多个 background 任务并行；活跃群设 cap=100-200
+
+# === Step 3: 拉私聊（DM）===
+lark-cli im +chat-messages-list --user-id "$TARGET_OU" --start "2025-11-01T00:00:00+08:00" \
+  --page-size 50 --sort desc --format json > /tmp/paginate-out/dm.json
+# DM 一般量小，一次拉完
+
+# === Step 4: 聚合 + 提取冲突信号 ===
+# 扁平化：所有群所有页合并 + 按时间排序 + 带 mid / reply 指针
+jq -s '[.[].data.messages[] | {t: .create_time, n: .sender.name, id: .sender.id,
+  mid: .message_id, c: .content, reply: .reply_to, type: .msg_type}] | sort_by(.t)' \
+  /tmp/paginate-out/<label>_page*.json > /tmp/paginate-out/<label>_flat.json
+
+# Target 发言量 + 我跟他的 reply 链（冲突密度最高的区域）
+jq --arg H "$TARGET_OU" --arg M "$MY_OU" '
+  (map({(.mid): .}) | add) as $by_mid |
+  [.[] | select(.reply != null) | . as $r | ($by_mid[.reply] // null) as $t |
+    select($t != null) |
+    select(($r.id == $M and $t.id == $H) or ($r.id == $H and $t.id == $M)) |
+    {time: $r.t, from: $r.n, reply: $r.c, replied_to: $t.c, replied_from: $t.n}
+  ] | sort_by(.time)
+' /tmp/paginate-out/<label>_flat.json > /tmp/paginate-out/<label>_reply_chains.json
+```
+
+**别忘了代号/别名**：同事群里经常用数字代号 / 表情符号 / 昵称 / 英文名缩写互称（代号化后真名在群里出现频率大幅下降）。**光搜真名会漏一半信号**。Step 1 之前 / Step 4 分析时一定要**问用户这个人在相关群里有没有别称**，加进过滤词。
 
 ### 其他已验证 shortcut（文档/日历等顺带记录）
 
