@@ -59,47 +59,63 @@ allowed-tools: Bash Read Write Edit AskUserQuestion
 
 带"会议转录"的分支会走 Step 3B。
 
-### Step 2: 读群/人档案 + 决定窗口
+### Step 2: 读 raw/_meta + memory 档案 → 决定窗口
+
+**拉取状态（checkpoint）归 raw，画像归 memory。** 两处分别读：
 
 **群路径**：
-- glob `../shared/memory/groups/*.md` → 按 frontmatter `chat_id` 匹配
-- 命中：Read 整个档案，拿 `last_processed_at` / `last_processed_message_id` / 已有"话题基线"/"近期简报"
-- 未命中：进入冷启动
+- **IO 状态** → `../shared/raw/chats/<chat_id>/_meta.json`
+  - 命中：读 `last_fetched_at` / `last_fetched_message_id` 作为增量锚点
+  - 未命中：冷启动（首次见到该群）
+- **画像** → glob `../shared/memory/groups/*.md`，frontmatter `chat_id` 匹配 → Read（拿"话题基线" / "近期简报" / 已有观察）
+  - 画像文件不存在不报错；可能已拉过消息但还没写过画像
 
 **窗口判断**：
 
 | 条件 | 模式 | 拉取窗口 |
 |---|---|---|
-| 档案不存在 / 无 `last_processed_at` / 距今 > 30 天 | **冷启动** | 默认最近 **14 天** |
-| `last_processed_at` 在 30 天内 | **增量** | `--start = last_processed_at + 1s` |
+| `_meta.json` 不存在 / `last_fetched_at` 距今 > 30 天 | **冷启动** | 默认最近 **14 天** |
+| `last_fetched_at` 在 30 天内 | **增量** | `--start = last_fetched_at + 1s` |
 | 用户显式指定 | **自定义** | 按用户 |
 
 **告诉用户选了哪个模式**（文本说明，不用 AskUserQuestion）：
 > "这个群 10 天前处理过，走增量模式，拉 2026-04-12T... 起的消息。"
 
-**人物路径**：类似，glob `persons/*.md`，但人档案没有 checkpoint 字段（目前），默认冷启动 14 天；也可以用关联群的 checkpoint 做增量锚点（Phase 0 可简化为"每次 14 天"，增量以后再加）。
+**人物路径**：
+- 画像：glob `persons/*.md`，frontmatter `lark_user_id` 匹配
+- IO 状态：按目标参与的每个**共同 chat**，分别读其 `raw/chats/<chat_id>/_meta.json`——人物路径是多 chat 聚合，所以 checkpoint 是 per-chat 的
 
-### Step 3: 拉消息（自动分页直到窗口边界）
+### Step 3: 拉消息 → 写 raw（按追加协议）
 
-查 `../shared/references/lark-cli-cookbook.md` "消息读取" + "增量/窗口拉取"配方。
+**所有拉取都要落盘 raw**。查 `../shared/references/lark-cli-cookbook.md` 的 **"Raw 数据缓存落盘协议"** 章节——脚本实现直接复制，别自己重写。核心三件事：
+1. 追加主消息到 `raw/chats/<chat_id>/<YYYY-MM>.ndjson`（按 create_time 月分桶，去重靠 message_id）
+2. 每条 `msg_type ∈ {image, file, audio, media}` 的消息**默认下载附件**到 `raw/attachments/<file_key>.<ext>`
+3. 每条带 `thread_id` 的主消息，按 lazy 规则拉 thread 到 `raw/chats/<chat_id>/threads/<thread_id>.ndjson`
+4. bump `_meta.json` 的 `last_fetched_at` / `last_fetched_message_id`
 
-- **群动态**：`+chat-messages-list --chat-id <id> --start <ISO8601> --sort desc`，循环 `page_token` 直到 `has_more=false` 或跨出窗口
-- **人物互动**：`+messages-search` 按 sender 过滤（flag 细节先 `--help`）
-- **今日 @**：cookbook "仍需 Phase 0 发现"段；短期兜底 = 逐 chat 拉近 24h + `jq` 过滤 `mentions` 含 user `userOpenId`
+**命令：**
+- **群动态**：`+chat-messages-list --chat-id <id> --start <ISO8601> --sort asc`（注意用 asc 方便月分桶顺序追加），走分页脚手架直到 `has_more=false` 或跨出窗口
+- **人物互动**：对每个共同 chat 走群动态流程；私聊（DM）同样走 `+chat-messages-list --user-id <ou>` 并按 p2p chat_id 落 raw
+- **今日 @**：cookbook "仍需 Phase 0 发现"段；短期兜底 = 逐 chat 拉近 24h + `jq` 过滤 `mentions` 含 user `userOpenId`。无论哪种路径，**经过的消息都要写 raw**——@ 也是群消息的一部分
 
-**hydration 按需**：retrospective 默认**不 hydrate**（图片/reply_to/thread 对趋势画像收益低）。triage 某条消息被遮蔽（reply_to 出窗、有图片）才补。
+**检查点：拉完 raw 先做一次完整性校验**（避免半拉状态误判下次增量）：
+- `_meta.last_fetched_message_id` 应该能 `grep` 到对应月桶里
+- 附件全部存在（for each file_key in raw messages → check raw/attachments/）
+
+**Hydration 与 raw 的关系：** 现在 hydration（thread / reply_to / 附件）其实就是"走追加协议"的一部分——缓存已经做了。分析时 reply_to 指针直接在月 ndjson 里找；找不到再 `+messages-mget` 拉补回 raw（补到原月桶）。
 
 ### Step 3B: 拉会议转录（仅人物路径，Step 1 选了含"会议转录"时）
 
-查 `../shared/references/lark-cli-cookbook.md` "会议转录拉取"配方。核心三步：
+查 `../shared/references/lark-cli-cookbook.md` 的 "会议转录拉取" + "Raw 数据缓存落盘协议 → Transcript"两段。核心三步：
 
 1. **搜会议**：`lark-cli vc +search --participant-ids <ou_target> --start <window> --end <now>` → 列出目标参与过的会议（title / minute_token / start_time / duration）
 2. **用户选场次**：调 `AskUserQuestion` 让用户勾选要分析哪几场——不要全量拉（每场 transcript 动辄数万字，整窗口拉会爆上下文，且很多会议只是例会/顺口提）。默认建议用户挑 1-3 场"议题密集"的
-3. **下载**：对每个选中 `minute_token` 跑 `lark-cli vc +notes --minute-tokens <token> --output-dir tmp/transcripts/<token>/` → 文件落在 `tmp/transcripts/<token>/transcript.txt`
+3. **下载到 raw**：对每个选中 `minute_token` 跑 `lark-cli vc +notes --minute-tokens <token> --output-dir ../shared/raw/transcripts/<token>/ --format json > ../shared/raw/transcripts/<token>/_meta.json` → transcript.txt + _meta.json 落 raw，**跨会话持久**
+4. **本地优先**：如果 `raw/transcripts/<token>/transcript.txt` 已存在就跳过下载——妙记逐字稿一旦生成不会变，缓存值得信任
 
 **说话人 → open_id 归属**：transcript 里的说话人标签是**显示名**（`EnglishName(中文名)`），不是 `open_id`。写观察前用 `contact +search-user --query "<中文名>"` 确认解析结果的 open_id 跟目标一致——同名 / 音近名的误伤会直接污染档案。
 
-**文件生命周期**：`tmp/transcripts/` 已 gitignore。Step 8 写完 memory 后 Step 9 **必须**清理对应目录，不留残渣。
+**文件生命周期**：raw/transcripts/ 已 gitignore，**跨会话持久不删**。同一会议后续再分析直接读本地，不再调 API。
 
 ### Step 4: 读其他 memory（背景上下文）
 
@@ -148,13 +164,9 @@ allowed-tools: Bash Read Write Edit AskUserQuestion
 ### `persons/li-si.md` → `## 沟通风格` (强化)
 - [消息] "又一次作为'架构脑'出现——某技术项目是他主动给的架构框架"
 - [会议:Plaud Kickoff] "00:14:32 他对细节被追问时直接说'这个我没想过'——跟消息里'深思熟虑'的印象有微冲突，疑似会议里更坦诚"
-
----
-
-## 候选更新：checkpoint（groups/<pinyin>.md frontmatter）
-- last_processed_at: 2026-04-22T15:04:00+08:00
-- last_processed_message_id: om_xxx
 ```
+
+**注意：不再需要"候选更新：checkpoint"段**——checkpoint 已经在 Step 3 拉消息时自动 bump 到 `raw/chats/<id>/_meta.json`，跟用户的 memory 写入决策解耦。用户 ABC 选 C（不写 memory）也不影响下次增量起点。
 
 **关键约束**：
 - 每条观察**必须标文件 + 建议 section 归属**（`groups/X.md` → `## Y`，或 `persons/X.md` → `## Y`）——让用户审阅时清楚要落哪
@@ -179,14 +191,15 @@ allowed-tools: Bash Read Write Edit AskUserQuestion
 
 ### Step 7: 询问是否落盘（按 index.md 的通用规则）
 
-**调 `AskUserQuestion` 工具**（不是文本），按 `../shared/memory/index.md` "所有 memory 写入的通用规则"的 4 选项：
+**调 `AskUserQuestion` 工具**（不是文本），按 `../shared/memory/index.md` "所有 memory 写入的通用规则"的 3 选项：
 
-- **A. 全部落** —— 按所有候选 diff 写入对应文件
-- **B. 只更 checkpoint** —— 忽略观察内容，只 bump `last_processed_at` / `last_processed_message_id`（仅群路径有此选项）
-- **C. 让我改一下** —— 用户口头说哪条要删/改/合并 → 重算 diff → 重新展示 → **循环**回到 Step 5 的展示，再调一次 AskUserQuestion
-- **D. 不落** —— 本次只看
+- **A. 落** —— 按候选 diff 写入对应文件
+- **B. 让我改一下** —— 用户口头说哪条要删/改/合并 → 重算 diff → 重新展示 → **循环**回到 Step 5 的展示，再调一次 AskUserQuestion
+- **C. 不落** —— 本次只看
 
-**如果写入涉及多个文件**（比如同时写 `groups/X.md` 和 `persons/Y.md`），**每个文件单独一个 A/B/C/D 选择**，不要"全部打包 yes/no"——有时用户对群档案满意但人档案还想改。
+IO 状态（`last_fetched_*`）跟用户选 A/B/C 无关——Step 3 拉消息时已经自动 bump 到 raw/_meta.json。
+
+**如果写入涉及多个文件**（比如同时写 `groups/X.md` 和 `persons/Y.md`），**每个文件单独一个 A/B/C 选择**，不要"全部打包 yes/no"——有时用户对群档案满意但人档案还想改。
 
 ### Step 8: 按用户选择写入
 
@@ -198,19 +211,16 @@ allowed-tools: Bash Read Write Edit AskUserQuestion
 
 ### Step 9: 收尾
 
-**如果走过 Step 3B**，先清理 transcript 暂存：
-```bash
-rm -rf tmp/transcripts/<minute_token_1>/ tmp/transcripts/<minute_token_2>/ ...
-```
-只删本次处理过的 minute_token 目录，不要盲目 `rm -rf tmp/transcripts/*`（同一会话可能有别的 skill 在用）。
+**不再删 raw**（消息 / transcript / 附件都是长期档案）。本步只做语义收尾：
 
-然后：
 ```
 "还要看别的群/人吗？或者你觉得观察还没写完，可以说 '再加一条 xxx' 我补进去。"
   → 用户要回某条消息 → "用 reply-coach"
-  → 用户要手动添加额外观察 → 留在 comm-brief，append 到 diff 再走一次 ABCD
+  → 用户要手动添加额外观察 → 留在 comm-brief，append 到 diff 再走一次 ABC
   → 用户要改已有档案的语义画像而不是从消息推 → "用 comm-memory"
 ```
+
+**唯一的清理**是 `tmp/` 下本 session 自己创建的中间文件（比如分页脚手架的 `/tmp/paginate-out/*.json`）——但这些是 OS 临时目录下的文件，OS 自己会清。
 
 ---
 
