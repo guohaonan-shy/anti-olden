@@ -437,14 +437,157 @@ lark-cli vc +notes \
 
 **关键坑：**
 - **说话人是 display name，不是 open_id**。要严谨归属到 `persons/<X>.md` 得先 `contact +search-user --query "<中文名>"` 解析，避免同名误伤
-- **`--output-dir` 必须显式给**。不给会落在 CWD 创建一个 `artifact-<title>-<token>/` 目录，污染仓库根。统一用 `tmp/transcripts/<minute_token>/`（`tmp/` 已 gitignore）
-- **Skill 用完即删**。comm-brief 的 Step 9 要清理本次处理的 `tmp/transcripts/<token>/`，transcript 不做本地持久化
+- **`--output-dir` 必须显式给**。不给会落在 CWD 创建一个 `artifact-<title>-<token>/` 目录，污染仓库根。统一用 `skills/shared/raw/transcripts/<minute_token>/`（raw/ 已 gitignore，详见下方"Raw 数据缓存"）
+- **Transcript 跨会话持久**。落到 raw/ 后**不删**——重看某场会议不用再调 `+notes`，纵向分析（同人多场会议对比）也能做
 - **长会议 token 成本高**。1 小时的会议 transcript 约 10-30K tokens——让用户挑场次（AskUserQuestion），不要自动全量拉
 
 **什么时候用（comm-brief 人物路径的数据源选择）：**
 - 默认只拉消息即可
 - 用户想看"完整画像" / 关心"线下尾巴" / 明确说"从最近那场会看 X 的表现" → 加会议转录这条路径
 - 群路径（给群做画像）**不走转录**——转录是个人行为数据，不是群结构数据
+
+### Raw 数据缓存落盘协议
+
+**设计文档权威来源**：`docs/memory-architecture.md`。本节是 CLI 层的操作手册——拉完数据**必须**按这个协议落盘，三个 skill 读 raw 才能复用。
+
+**目录约定：**
+
+```
+skills/shared/raw/
+├── chats/<chat_id>/
+│   ├── _meta.json                    # chat 元信息 + last_fetched_*
+│   ├── <YYYY-MM>.ndjson              # 主消息按月分桶，一行一条
+│   └── threads/<thread_id>.ndjson    # thread 子消息，按 thread 分文件
+├── attachments/<file_key>.<ext>      # 图片 / 文件 / 音频
+└── transcripts/<minute_token>/       # 会议逐字稿（跨会话持久）
+    ├── _meta.json
+    └── transcript.txt
+```
+
+整个 `skills/shared/raw/` 已 gitignore。每人本地独立维护，不合并不同步。
+
+**Checkpoint：** `last_fetched_at` / `last_fetched_message_id` 只放 `raw/chats/<id>/_meta.json`，**不再写 memory frontmatter**。IO 状态归 raw，画像归 memory。
+
+---
+
+**追加协议（消息）：**
+
+```bash
+CHAT_ID="oc_xxxxxx"
+RAW_DIR="skills/shared/raw/chats/$CHAT_ID"
+mkdir -p "$RAW_DIR/threads"
+
+# 1) 读 _meta.json 拿 last_fetched_at 作为增量起点
+SINCE=$(jq -r '.last_fetched_at // "2026-01-01T00:00:00+08:00"' "$RAW_DIR/_meta.json" 2>/dev/null)
+
+# 2) 拉消息（走分页脚手架；示例用单页）
+lark-cli im +chat-messages-list --chat-id "$CHAT_ID" --start "$SINCE" \
+  --page-size 50 --sort asc --format json > /tmp/fetch.json
+
+# 3) 按 create_time 月份分桶追加（去重由 message_id 保证）
+jq -c '.data.messages[]' /tmp/fetch.json | while read -r msg; do
+  MID=$(echo "$msg" | jq -r '.message_id')
+  MONTH=$(echo "$msg" | jq -r '.create_time[:7]')   # "2026-04"
+  BUCKET="$RAW_DIR/$MONTH.ndjson"
+  # 去重：消息 ID 已在文件里则跳过
+  if [ -f "$BUCKET" ] && grep -qF "\"message_id\":\"$MID\"" "$BUCKET"; then
+    continue
+  fi
+  echo "$msg" >> "$BUCKET"
+done
+
+# 4) 更新 _meta.json 的 last_fetched_*（jq 原地改写）
+LAST_MID=$(jq -r '.data.messages[-1].message_id' /tmp/fetch.json)
+LAST_TS=$(jq -r '.data.messages[-1].create_time' /tmp/fetch.json)
+jq --arg mid "$LAST_MID" --arg ts "$LAST_TS" \
+   '. + {last_fetched_at: $ts, last_fetched_message_id: $mid}' \
+   "$RAW_DIR/_meta.json" > "$RAW_DIR/_meta.json.tmp" && mv "$RAW_DIR/_meta.json.tmp" "$RAW_DIR/_meta.json"
+```
+
+**首次冷启动 chat（`_meta.json` 不存在）：** 写一份初始 meta，字段包括 `chat_id / chat_type / name / member_open_ids / first_fetched_at`。`chat_type` 和成员列表从 `lark-cli im +chat-info --chat-id <id>` 或 `api GET /open-apis/im/v1/chats/<id>` 拿（首次用跑 `--help` 确认 shortcut 名）。
+
+---
+
+**Thread 子消息（lazy + 按需）：**
+
+不要见到 `thread_id` 就拉——很多 thread 永远不会被分析用到。下游分析需要 hydrate 某 thread 时才拉：
+
+```bash
+THREAD_ID="omt_xxxxxx"
+THREAD_FILE="skills/shared/raw/chats/$CHAT_ID/threads/$THREAD_ID.ndjson"
+
+if [ -f "$THREAD_FILE" ]; then
+  # 已缓存：看是否需要增量补齐
+  LAST_TS=$(tail -n 1 "$THREAD_FILE" | jq -r '.create_time')
+  # 简单策略：距今 < 5 分钟直接用本地；否则按 LAST_TS+1s 拉增量
+else
+  # 首次拉全量
+  lark-cli im +threads-messages-list --thread "$THREAD_ID" --sort asc \
+    --page-size 500 --format json | jq -c '.data.items[]' >> "$THREAD_FILE"
+fi
+```
+
+Thread 文件独立、按 `thread_id` 命名；主消息仍留在月 ndjson 里，不改结构。
+
+---
+
+**附件下载（默认拉）：**
+
+每条 `msg_type ∈ {image, file, audio, media}` 的消息**默认**下载附件。`file_key` 从消息 content 字段解析（image 是 `img_v3_xxx`，file 是 `file_xxx`）。
+
+```bash
+ATT_DIR="skills/shared/raw/attachments"
+mkdir -p "$ATT_DIR"
+
+# file_key / msg_type / extension 从消息解析得到
+FILE_KEY="img_v3_02111_xxxxxx"
+MSG_TYPE="image"
+EXT="jpg"   # image → jpg/png；file → 原扩展名（API 返回）；audio → m4a
+
+# 已存在则跳过（file_key 全局唯一）
+if [ ! -f "$ATT_DIR/$FILE_KEY.$EXT" ]; then
+  lark-cli im +messages-resources-download \
+    --message-id "$MID" \
+    --file-key "$FILE_KEY" \
+    --type "$MSG_TYPE" \
+    --output "$ATT_DIR/$FILE_KEY.$EXT"
+fi
+```
+
+**使用方式：** 分析时 skill 用 `Read` 工具直接加载 `$ATT_DIR/<file_key>.<ext>`——图片走 Claude 视觉，文本文件按扩展名处理。
+
+---
+
+**Transcript（会议逐字稿）：**
+
+从 tmp/ 升格为 raw/transcripts/<minute_token>/，`vc +notes` 直接指向该目录：
+
+```bash
+lark-cli vc +notes --minute-tokens "$MINUTE_TOKEN" \
+  --output-dir "skills/shared/raw/transcripts/$MINUTE_TOKEN/" \
+  --format json > "skills/shared/raw/transcripts/$MINUTE_TOKEN/_meta.json"
+```
+
+`_meta.json` 里保留 `vc +notes` 的 JSON 响应（title / meeting_time / creator_id / note_doc_token / verbatim_doc_token 等）；`transcript.txt` 是 lark-cli 自动下载的逐字稿。**不删**——重看某场会议用 Read 本地即可。
+
+---
+
+**skill 读 raw 的一般模式：**
+
+```bash
+# 某个 chat 的历史窗口（按月通配）
+jq -s 'flatten | sort_by(.create_time)' skills/shared/raw/chats/$CHAT_ID/2026-0[3-4].ndjson
+
+# 某人在所有群的发言（按 sender.id 过滤）
+for f in skills/shared/raw/chats/*/20*.ndjson; do
+  jq -c --arg ou "$TARGET_OU" 'select(.sender.id == $ou)' "$f"
+done | jq -s 'sort_by(.create_time)'
+
+# 某 thread 完整内容
+cat skills/shared/raw/chats/$CHAT_ID/threads/$THREAD_ID.ndjson | jq -s '.'
+```
+
+**重要：** raw 是"原始数据的事实"，memory 是"从事实里提炼的观察"——分析时 read raw 当**输入**，写 memory 当**输出**，不要让 skill 把原始消息直接 copy 进 memory markdown。
 
 ### 其他已验证 shortcut（文档/日历等顺带记录）
 

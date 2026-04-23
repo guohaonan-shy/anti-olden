@@ -7,5 +7,8 @@ skills/shared/memory/user-profile.md
 skills/shared/memory/persons/
 skills/shared/memory/groups/
 
-# Transcript / artifact 暂存（skill 用完即删，不入仓库）
+# 短暂 scratch（skill 用完即删，不入仓库）
 tmp/
+
+# 原始数据缓存（跨会话持久，每人本地维护，见 docs/memory-architecture.md）
+skills/shared/raw/

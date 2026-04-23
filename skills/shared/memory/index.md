@@ -18,7 +18,7 @@ Memory 文件（`user-profile.md` / `persons/*.md` / `groups/*.md`）的**正文
 
 **当前用户自己的身份不持久化**——运行时查 `lark-cli auth status --format json` 拿 `userOpenId`（详见 cookbook "查当前用户身份"）。不把 ou_id / app_id 写进 `user-profile.md`。
 
-**正文 section 自由，frontmatter 字段固定。** Template 里列的 `## 沟通风格` / `## 群氛围` 等是**参考骨架，不是 schema**——每份档案可以按对方/该群的真实特点增删改 section（老板档案 vs 同事 vs 朋友 section 应不同）。AI 不要为"符合模板"强行填空或漏填；也不要在已有档案里乱改 section 结构——**沿用该文件既有的 section**，新观察无处可落就新开一个 section 跟用户确认。只有 frontmatter 机器字段（`lark_user_id` / `chat_id` / `last_processed_*` / `last_updated`）是必守的。
+**正文 section 自由，frontmatter 字段固定。** Template 里列的 `## 沟通风格` / `## 群氛围` 等是**参考骨架，不是 schema**——每份档案可以按对方/该群的真实特点增删改 section（老板档案 vs 同事 vs 朋友 section 应不同）。AI 不要为"符合模板"强行填空或漏填；也不要在已有档案里乱改 section 结构——**沿用该文件既有的 section**，新观察无处可落就新开一个 section 跟用户确认。只有 frontmatter 机器字段（`lark_user_id` / `chat_id` / `last_updated`）是必守的。**拉取状态（`last_fetched_*`）不在 memory frontmatter 里**——归 `raw/chats/<chat_id>/_meta.json`，见 `docs/memory-architecture.md` §4.1。
 
 ---
 
@@ -38,14 +38,15 @@ Skill 需要定位某条消息对应的 person/group 文件时：
 
 1. **整理拟写入 diff**（整段或整块增量）
 2. **展示 diff 给用户**（格式化清晰，原样贴）
-3. **调 `AskUserQuestion` 工具**（不是文本问）给 4 个选项：
+3. **调 `AskUserQuestion` 工具**（不是文本问）给 3 个选项：
    - **A. 写入** —— 按 diff 落
-   - **B. 只更 checkpoint** —— 仅 comm-brief 群档案相关时有此选项；跳过内容，只 bump 时间戳 / message_id
-   - **C. 让我改一下** —— 用户口头说怎么改 → AI 按修改重新算 diff → 回到第 2 步再展示 → 再问 —— **循环直到 A 或 D**
-   - **D. 不写** —— 跳过
-4. **选 C 必须循环**：改几次都要重新展示 + 重新问。不能改完就静默写。
+   - **B. 让我改一下** —— 用户口头说怎么改 → AI 按修改重新算 diff → 回到第 2 步再展示 → 再问 —— **循环直到 A 或 C**
+   - **C. 不写** —— 跳过
+4. **选 B 必须循环**：改几次都要重新展示 + 重新问。不能改完就静默写。
 
 memory 是 AI + 用户共同作者的产物；用户必须有"我说了算 + 我能改"的纠偏权。
+
+**为什么没有"只更 checkpoint"这个选项了？** 双层架构下 IO 状态（`last_fetched_*`）属于 raw/_meta.json，comm-brief 在 Step 3 拉消息时**就地**自动 bump，不需要用户确认。用户选 C（不写 memory）不影响下次增量起点——raw 已经吃过这批消息。
 
 ---
 
@@ -61,7 +62,7 @@ memory 是 AI + 用户共同作者的产物；用户必须有"我说了算 + 我
 | `persons/*.md`（正文 + frontmatter） | ❌ | ✅（消息里观察到的人物特征 / 互动模式） | ✅ |
 | `groups/*.md` → `群氛围` / `关键人物` / `注意事项` | ❌ | ✅（从消息观察） | ✅ |
 | `groups/*.md` → `话题基线` / `近期简报` | ❌ | ✅（冷启动建基线、增量加条目） | ✅ |
-| `groups/*.md` → frontmatter checkpoint 字段 | ❌ | ✅（自动 bump） | ✅ |
+| `raw/chats/<id>/_meta.json` → `last_fetched_*` | ❌ | ✅（拉消息时自动 bump，不走用户确认） | ❌（不拉消息） |
 
 **所有写入都受上面"通用规则"约束**——经用户 ABCD 选 A 才写，选 C 要循环改。
 
@@ -69,14 +70,15 @@ memory 是 AI + 用户共同作者的产物；用户必须有"我说了算 + 我
 
 ---
 
-## 群档案 checkpoint 字段
+## Checkpoint 归属于 raw/_meta.json
 
-`groups/*.md` frontmatter 两个机器字段，由 comm-brief 增量模式消费和更新：
+**不再在 memory frontmatter 里存 `last_processed_*`**。IO 状态（拉到哪里了）归 raw 层：
 
-- `last_processed_at: 2026-04-22T14:50:00+08:00` — 上次处理到的消息时间（CLI `--start` 参数）
-- `last_processed_message_id: om_xxxxxxx` — 上次处理到的具体消息 ID（防同秒重复 / 精确锚点）
+- `raw/chats/<chat_id>/_meta.json` 的 `last_fetched_at` / `last_fetched_message_id`
+- comm-brief 拉消息时自动 bump，不走用户确认
+- 冷启动触发条件不变：`_meta.json` 不存在 / `last_fetched_at` 距今 > 30 天 → 冷启动默认拉近 **14 天**
 
-冷启动触发条件：无档案 / 字段缺失 / `last_processed_at` 距今 > 30 天。冷启动默认拉近 **14 天**。
+设计理由见 `docs/memory-architecture.md` §4.1。memory 文件专注承载"画像"，IO 状态不污染正文和 frontmatter。
 
 ---
 

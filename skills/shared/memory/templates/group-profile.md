@@ -2,15 +2,13 @@
 group_name: <群名>
 chat_id: oc_xxxxxxxxxxxxxxx
 last_updated: YYYY-MM-DD
-# 以下两个字段由 comm-brief 维护（用户确认写入后才 bump），作为增量处理的锚点
-last_processed_at: <ISO8601，如 2026-04-22T14:50:00+08:00>
-last_processed_message_id: om_xxxxxxxxxxxxxxx
 ---
 
 <!--
   以下 section 是**参考骨架，不是 schema**。
   每个群可以按实际形态增删改 section（例：项目群可能需要 "## 里程碑时间线"；跨部门群可能需要 "## 各方立场"；八卦群可能不需要 "## 注意事项"）。
-  Frontmatter 才是必守的机器字段（chat_id / checkpoint 等）。
+  Frontmatter 里只有 chat_id 是机器字段，其他自由。
+  拉取状态（last_fetched_at / _message_id）归 raw/chats/<chat_id>/_meta.json，本文件不再承载 IO 状态——详见 docs/memory-architecture.md §4.1。
   AI 在建档/编辑时：1) 不要为"符合模板"强行填空； 2) 不要在已有档案里乱改 section 结构——沿用现有 section；新观察无处可落就新开一个 section 跟用户确认。
 -->
 
