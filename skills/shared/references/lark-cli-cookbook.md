@@ -15,18 +15,82 @@ npm install -g @larksuite/cli
 ```
 
 ### 首次配置（一次性）
+
 ```bash
-lark-cli config init --new          # 配置应用凭证
-lark-cli auth login --recommend     # OAuth 浏览器授权，自动推荐常用权限
-lark-cli auth status                # 验证登录
+lark-cli config init --new                      # 配置应用凭证
+lark-cli auth login --scope "<显式 scope 列表>"  # 授权（scope 从下面最小集复制）
+lark-cli auth status                            # 验证 token 里实际带上了哪些 scope
 ```
 
-若需更细粒度的 scope：
+**为什么精确 `--scope`，不用 `--recommend` / `--domain`：**
+- `--recommend` / `--domain` 只请求"常用/推荐"scope——**需审核的**（如 `minutes:minutes.transcript:export`）不会进授权页，走这条路到 `vc +notes` 就 `missing_scope` 401
+- 明确 `--scope` 让每个 skill 跟它依赖的 scope 对得上，加新 skill 时清楚要追加什么
+- scope 一旦授权，下次换机器/刷 token 复用这条字符串即可
+
+**三个 skill 当前最小 scope 集合（16 条，2026-04-23 实测）：**
+
+```
+# 认证基建
+auth:user.id:read
+offline_access
+
+# 消息读取（reply-coach / comm-brief）
+im:message:readonly
+im:message.group_msg:get_as_user
+im:message.p2p_msg:get_as_user
+im:chat:read
+im:chat.members:read
+
+# 联系人查找
+contact:user.base:readonly
+contact:user:search
+
+# 会议索引（comm-brief 人物路径）
+vc:meeting.search:read
+vc:record:readonly
+vc:note:read
+
+# 妙记内容（transcript 链路）
+minutes:minutes.search:read                 # 免审
+minutes:minutes:readonly                    # 需审核
+minutes:minutes.artifacts:read              # 免审（summary / todos / chapters）
+minutes:minutes.transcript:export           # 需审核（逐字稿导出）
+```
+
+**Write scope 刻意不申请**。CLAUDE.md §"安全边界"规定所有写入要用户显式确认，Phase 0 默认行为是生成文本让用户复制粘贴。未来某个 skill 真要自动发送，单独追加 `im:message` / `im:chat:update` / `im:chat.members:write_only` 再评估确认门在哪。
+
+**Agent 非阻塞授权流（Claude Code / 自动化场景）：**
+
+`lark-cli auth login` 默认阻塞等浏览器完成授权。Agent 里要拆成两步——请求 device code 时立刻返回、另起后台任务 poll 结果：
+
 ```bash
-lark-cli auth login --domain calendar,task
-lark-cli auth login --scope "im:message.group_msg"
-lark-cli auth scopes                # 列出可用 scope
-lark-cli auth check --scope "<scope>"  # 验证当前 token 是否有某个权限
+# Step 1：申请 device code，立刻返回
+lark-cli auth login --no-wait --json --scope "<scope 列表>"
+# 输出：{"device_code":"...", "verification_url":"...", "expires_in":600, "hint":"..."}
+
+# Step 2：后台阻塞 polling（agent 侧 run_in_background + Monitor 挂事件）
+lark-cli auth login --device-code "<device_code>" --json
+# 用户完成授权后返回 token + granted/newly_granted/missing
+```
+
+第 1 步把 `verification_url` 给用户打开；第 2 步挂 Monitor 等 `"ok":true` / `error` 信号。实战示例见 Phase 0 transcript 授权 session 记录。
+
+**⚠️ OAuth scope 累积坑**：飞书 OAuth **不允许用 `--scope` 缩窄 token**。新 token 的 scope = `历史累计 ∪ 本次请求`——哪怕这次只请求 3 条，之前授过的都会被继承。真要缩范围：
+
+```bash
+lark-cli auth logout                             # 先撤销现有 token
+# 去开放平台后台把应用声明里不需要的 scope 删掉
+lark-cli auth login --scope "<小集合>"           # 再重新授权
+```
+
+**权限审核层级（开放平台后台）：**
+- "免审权限"勾上即时生效
+- "需审核权限"（如 transcript 导出）走**应用管理员在企业管理后台审批**——自建应用管理员通常就是应用创建者本人，自己批一下即可，**不是**飞书平台人工审，不用等
+
+**辅助命令：**
+```bash
+lark-cli auth scopes                            # 列出当前应用可申请的所有 scope
+lark-cli auth check --scope "<scope>"           # 验证当前 token 是否包含某个 scope
 ```
 
 ### 登录状态
@@ -440,8 +504,8 @@ lark-cli api GET /open-apis/im/v1/messages \
 | 现象 | 处理 |
 |---|---|
 | `lark-cli: command not found` | `npm install -g @larksuite/cli` |
-| `not authenticated` / `401` | `lark-cli auth login --recommend` |
-| `403 / permission denied` | `lark-cli auth check --scope "<scope>"` 确认，缺的用 `lark-cli auth login --scope "<scope>"` 重新授权 |
+| `not authenticated` / `401` | 参考"首次配置"的最小 scope 集，跑 `lark-cli auth login --scope "<完整列表>"` |
+| `403 / permission denied` / `missing_scope` | `lark-cli auth check --scope "<scope>"` 确认缺什么；缺的补进 scope 字符串重跑 `auth login`。注意 OAuth **累积**，新 token 会带上历史 scope |
 | `429` 限流 | 等几秒重试；多次出现缩小 `page_size` |
 | JSON 解析失败 | 把原始输出贴给用户看，**不要假装拿到了结构化数据** |
 | Shortcut 不认 | 用 `lark-cli api` 直接走原始 API |
