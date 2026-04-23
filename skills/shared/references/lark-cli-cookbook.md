@@ -317,6 +317,71 @@ jq --arg H "$TARGET_OU" --arg M "$MY_OU" '
 
 **别忘了代号/别名**：同事群里经常用数字代号 / 表情符号 / 昵称 / 英文名缩写互称（代号化后真名在群里出现频率大幅下降）。**光搜真名会漏一半信号**。Step 1 之前 / Step 4 分析时一定要**问用户这个人在相关群里有没有别称**，加进过滤词。
 
+### 会议转录拉取（vc / minutes）
+
+飞书会议的逐字稿由妙记（Minutes）产品托管，通过 `vc` 命名空间的三个命令索引到。人物画像里"线下尾巴"的核心数据源——**群里的人是他愿意让你看的形象，会议里才漏尾巴**。
+
+**前置：scope 必须齐全。** 三个妙记 scope 缺一个 `vc +notes` 就会 403：`minutes:minutes:readonly` / `minutes:minutes.artifacts:read` / `minutes:minutes.transcript:export`。详见本文件"前置准备"的 auth 章节。
+
+**三步链路：**
+
+```bash
+# === Step 1: 搜会议 ===
+# 按参会人 + 时间范围找会议（人物路径的典型用法）
+lark-cli vc +search \
+  --participant-ids "<ou_target>" \
+  --start "2026-03-01" \
+  --end "2026-04-23" \
+  --page-size 15 --format json \
+  | jq '.data.meetings[] | {minute_token, title, start_time, duration}'
+# 返回：title / minute_token / start_time / duration
+# 也支持 --query <关键词>, --organizer-ids <ou>, --room-ids <room>
+# 注意：--participant-ids 可传 "me" 代表当前用户
+
+# === Step 2: meeting_id → minute_token (如果上一步已给 minute_token 可跳) ===
+# 少数场景从 meeting_id 或 calendar_event_id 出发时才用
+lark-cli vc +recording \
+  --meeting-ids "<meeting_id>" \
+  --format json
+# 也支持 --calendar-event-ids
+
+# === Step 3: 拉 notes (summary + todos + transcript) ===
+lark-cli vc +notes \
+  --minute-tokens "<token1>,<token2>" \
+  --output-dir "tmp/transcripts/<minute_token>/" \
+  --format json
+# Transcript 落盘成 tmp/transcripts/<token>/transcript.txt（不是内联返回）
+# JSON 返回索引：note_doc_token（AI 笔记 docx）/ verbatim_doc_token（逐字稿 docx）/ artifacts.transcript_file（本次下载的路径）
+# --output-dir 强制指定输出目录——不给会污染 CWD（见下面"安全边界"段）
+# 批量：逗号分隔 tokens，单次最多 N 个（首次实测时确认）
+```
+
+**Transcript 文件格式** (`transcript.txt`)：
+
+```
+<ISO 时间>|<总时长>
+
+关键词:
+<AI 抽取的关键词>
+
+<说话人英文名>(<说话人中文名>) HH:MM:SS.ms 
+<发言内容，原始逐字，含填充词/打断/重复>
+
+<下一位说话人> HH:MM:SS.ms 
+...
+```
+
+**关键坑：**
+- **说话人是 display name，不是 open_id**。要严谨归属到 `persons/<X>.md` 得先 `contact +search-user --query "<中文名>"` 解析，避免同名误伤
+- **`--output-dir` 必须显式给**。不给会落在 CWD 创建一个 `artifact-<title>-<token>/` 目录，污染仓库根。统一用 `tmp/transcripts/<minute_token>/`（`tmp/` 已 gitignore）
+- **Skill 用完即删**。comm-brief 的 Step 9 要清理本次处理的 `tmp/transcripts/<token>/`，transcript 不做本地持久化
+- **长会议 token 成本高**。1 小时的会议 transcript 约 10-30K tokens——让用户挑场次（AskUserQuestion），不要自动全量拉
+
+**什么时候用（comm-brief 人物路径的数据源选择）：**
+- 默认只拉消息即可
+- 用户想看"完整画像" / 关心"线下尾巴" / 明确说"从最近那场会看 X 的表现" → 加会议转录这条路径
+- 群路径（给群做画像）**不走转录**——转录是个人行为数据，不是群结构数据
+
 ### 其他已验证 shortcut（文档/日历等顺带记录）
 
 ```bash

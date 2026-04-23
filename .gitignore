@@ -6,3 +6,6 @@
 skills/shared/memory/user-profile.md
 skills/shared/memory/persons/
 skills/shared/memory/groups/
+
+# Transcript / artifact 暂存（skill 用完即删，不入仓库）
+tmp/
