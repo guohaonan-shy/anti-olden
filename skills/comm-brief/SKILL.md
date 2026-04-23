@@ -1,6 +1,6 @@
 ---
 name: comm-brief
-description: 重流程——从飞书消息出发给群/人做 memory 分析：拉 lark-cli 消息 → AI 分析出候选观察 → 主动问用户"你有啥要一起加的认知" → 合并口述和消息观察 → 用户审+改+落。触发：用户只给了对象没给描述，比如"给 X 建档"/"xx 群最近啥情况"/"给 xx 群建档"/"最近半个月 xx 群有什么变化"/"看跟 X 最近互动"/"今天谁 @ 我了"。如果用户已经把完整口述讲出来了（"X 是 xxx 风格，雷区是 xxx"），走 comm-memory 而不是本 skill。
+description: 重流程——从飞书消息和会议转录出发给群/人做 memory 分析：拉 lark-cli 消息/转录 → AI 分析出候选观察 → 主动问用户"你有啥要一起加的认知" → 合并口述和外部观察 → 用户审+改+落。触发：用户只给了对象没给描述，比如"给 X 建档"/"xx 群最近啥情况"/"给 xx 群建档"/"最近半个月 xx 群有什么变化"/"看跟 X 最近互动"/"今天谁 @ 我了"/"从最近那场会看看 X 的表现"。如果用户已经把完整口述讲出来了（"X 是 xxx 风格，雷区是 xxx"），走 comm-memory 而不是本 skill。
 allowed-tools: Bash Read Write Edit AskUserQuestion
 ---
 
@@ -14,7 +14,9 @@ allowed-tools: Bash Read Write Edit AskUserQuestion
 
 两种输入形态：
 - **群动态**（某个 chat_id + 时间窗）→ 冷启动 14 天 / 增量按 checkpoint
-- **人物互动**（某个 ou_id + 时间窗）→ 聚焦该人近期表现
+- **人物互动**（某个 ou_id + 时间窗）→ 聚焦该人近期表现，数据源可选"消息 / 消息+会议转录 / 只会议转录"
+
+会议转录是人物路径专有的补充源——群里的人是他愿意让你看的形象，会议里才漏尾巴（插话、hedging、被追问时的反应等）。群路径不走转录。
 
 两种输出形态都是**增量语气的候选观察**——"过去 14 天新发现 / 新变化 / 模式强化"，不是"这个群长这样"的状态快照。
 
@@ -48,6 +50,15 @@ allowed-tools: Bash Read Write Edit AskUserQuestion
 
 用户回答的代号要加进后续 Step 3 / Step 4 的文本过滤关键词。
 
+**人物路径必问：数据源**。再调一次 `AskUserQuestion` 让用户选画像的输入：
+> "分析数据源：消息（群+DM）/ 消息 + 会议转录 / 只看会议转录？"
+
+- **消息** — 默认、最快，适合大多数人
+- **消息 + 会议转录** — 用户要"完整画像"、或关心这人"线下尾巴"时
+- **只看会议转录** — 用户明确说"从 X 场会看看他"时
+
+带"会议转录"的分支会走 Step 3B。
+
 ### Step 2: 读群/人档案 + 决定窗口
 
 **群路径**：
@@ -78,6 +89,18 @@ allowed-tools: Bash Read Write Edit AskUserQuestion
 
 **hydration 按需**：retrospective 默认**不 hydrate**（图片/reply_to/thread 对趋势画像收益低）。triage 某条消息被遮蔽（reply_to 出窗、有图片）才补。
 
+### Step 3B: 拉会议转录（仅人物路径，Step 1 选了含"会议转录"时）
+
+查 `../shared/references/lark-cli-cookbook.md` "会议转录拉取"配方。核心三步：
+
+1. **搜会议**：`lark-cli vc +search --participant-ids <ou_target> --start <window> --end <now>` → 列出目标参与过的会议（title / minute_token / start_time / duration）
+2. **用户选场次**：调 `AskUserQuestion` 让用户勾选要分析哪几场——不要全量拉（每场 transcript 动辄数万字，整窗口拉会爆上下文，且很多会议只是例会/顺口提）。默认建议用户挑 1-3 场"议题密集"的
+3. **下载**：对每个选中 `minute_token` 跑 `lark-cli vc +notes --minute-tokens <token> --output-dir tmp/transcripts/<token>/` → 文件落在 `tmp/transcripts/<token>/transcript.txt`
+
+**说话人 → open_id 归属**：transcript 里的说话人标签是**显示名**（`EnglishName(中文名)`），不是 `open_id`。写观察前用 `contact +search-user --query "<中文名>"` 确认解析结果的 open_id 跟目标一致——同名 / 音近名的误伤会直接污染档案。
+
+**文件生命周期**：`tmp/transcripts/` 已 gitignore。Step 8 写完 memory 后 Step 9 **必须**清理对应目录，不留残渣。
+
 ### Step 4: 读其他 memory（背景上下文）
 
 - Read `user-profile.md`（知道"我"是谁 → 影响"我"在本群的观察角度）
@@ -89,6 +112,12 @@ allowed-tools: Bash Read Write Edit AskUserQuestion
 ### Step 5: 生成**变化观察清单**（diff-shape，不是状态快照）
 
 **核心心法**：每条观察都要能直接映射到某个 memory 文件的某个 section。用**"新发现 / 强化 / 冲突 / 退潮"**这种**增量语气**，不用"这个群是什么样"的描述语气。
+
+**按源分别跑分析 prompt：**
+- 消息 → `../shared/prompts/analyze.md`
+- 会议转录 → `../shared/prompts/analyze-transcript.md`（含"线下尾巴"观察框架）
+
+两者产出的观察合并进同一份 diff 清单，但**每条观察必须标明来源**：`[消息]` 或 `[会议:<会议标题>]`——这样用户审阅时知道这条信号是从群聊还是会议里来的。
 
 **格式**（按写入目标分组）：
 
@@ -114,10 +143,11 @@ allowed-tools: Bash Read Write Edit AskUserQuestion
 ## 候选写入：persons/<pinyin>.md
 
 ### `persons/zhang-san.md` → `## 互动模式` (新观察)
-- "过去 14 天在 X 群表现出'吐槽 + brainstorm 建设性'混合模式，不只是发泄型"
+- [消息] "过去 14 天在 X 群表现出'吐槽 + brainstorm 建设性'混合模式，不只是发泄型"
 
 ### `persons/li-si.md` → `## 沟通风格` (强化)
-- "又一次作为'架构脑'出现——某技术项目是他主动给的架构框架"
+- [消息] "又一次作为'架构脑'出现——某技术项目是他主动给的架构框架"
+- [会议:Plaud Kickoff] "00:14:32 他对细节被追问时直接说'这个我没想过'——跟消息里'深思熟虑'的印象有微冲突，疑似会议里更坦诚"
 
 ---
 
@@ -168,6 +198,13 @@ allowed-tools: Bash Read Write Edit AskUserQuestion
 
 ### Step 9: 收尾
 
+**如果走过 Step 3B**，先清理 transcript 暂存：
+```bash
+rm -rf tmp/transcripts/<minute_token_1>/ tmp/transcripts/<minute_token_2>/ ...
+```
+只删本次处理过的 minute_token 目录，不要盲目 `rm -rf tmp/transcripts/*`（同一会话可能有别的 skill 在用）。
+
+然后：
 ```
 "还要看别的群/人吗？或者你觉得观察还没写完，可以说 '再加一条 xxx' 我补进去。"
   → 用户要回某条消息 → "用 reply-coach"

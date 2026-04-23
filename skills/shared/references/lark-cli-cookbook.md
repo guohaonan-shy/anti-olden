@@ -15,18 +15,82 @@ npm install -g @larksuite/cli
 ```
 
 ### 首次配置（一次性）
+
 ```bash
-lark-cli config init --new          # 配置应用凭证
-lark-cli auth login --recommend     # OAuth 浏览器授权，自动推荐常用权限
-lark-cli auth status                # 验证登录
+lark-cli config init --new                      # 配置应用凭证
+lark-cli auth login --scope "<显式 scope 列表>"  # 授权（scope 从下面最小集复制）
+lark-cli auth status                            # 验证 token 里实际带上了哪些 scope
 ```
 
-若需更细粒度的 scope：
+**为什么精确 `--scope`，不用 `--recommend` / `--domain`：**
+- `--recommend` / `--domain` 只请求"常用/推荐"scope——**需审核的**（如 `minutes:minutes.transcript:export`）不会进授权页，走这条路到 `vc +notes` 就 `missing_scope` 401
+- 明确 `--scope` 让每个 skill 跟它依赖的 scope 对得上，加新 skill 时清楚要追加什么
+- scope 一旦授权，下次换机器/刷 token 复用这条字符串即可
+
+**三个 skill 当前最小 scope 集合（16 条，2026-04-23 实测）：**
+
+```
+# 认证基建
+auth:user.id:read
+offline_access
+
+# 消息读取（reply-coach / comm-brief）
+im:message:readonly
+im:message.group_msg:get_as_user
+im:message.p2p_msg:get_as_user
+im:chat:read
+im:chat.members:read
+
+# 联系人查找
+contact:user.base:readonly
+contact:user:search
+
+# 会议索引（comm-brief 人物路径）
+vc:meeting.search:read
+vc:record:readonly
+vc:note:read
+
+# 妙记内容（transcript 链路）
+minutes:minutes.search:read                 # 免审
+minutes:minutes:readonly                    # 需审核
+minutes:minutes.artifacts:read              # 免审（summary / todos / chapters）
+minutes:minutes.transcript:export           # 需审核（逐字稿导出）
+```
+
+**Write scope 刻意不申请**。CLAUDE.md §"安全边界"规定所有写入要用户显式确认，Phase 0 默认行为是生成文本让用户复制粘贴。未来某个 skill 真要自动发送，单独追加 `im:message` / `im:chat:update` / `im:chat.members:write_only` 再评估确认门在哪。
+
+**Agent 非阻塞授权流（Claude Code / 自动化场景）：**
+
+`lark-cli auth login` 默认阻塞等浏览器完成授权。Agent 里要拆成两步——请求 device code 时立刻返回、另起后台任务 poll 结果：
+
 ```bash
-lark-cli auth login --domain calendar,task
-lark-cli auth login --scope "im:message.group_msg"
-lark-cli auth scopes                # 列出可用 scope
-lark-cli auth check --scope "<scope>"  # 验证当前 token 是否有某个权限
+# Step 1：申请 device code，立刻返回
+lark-cli auth login --no-wait --json --scope "<scope 列表>"
+# 输出：{"device_code":"...", "verification_url":"...", "expires_in":600, "hint":"..."}
+
+# Step 2：后台阻塞 polling（agent 侧 run_in_background + Monitor 挂事件）
+lark-cli auth login --device-code "<device_code>" --json
+# 用户完成授权后返回 token + granted/newly_granted/missing
+```
+
+第 1 步把 `verification_url` 给用户打开；第 2 步挂 Monitor 等 `"ok":true` / `error` 信号。实战示例见 Phase 0 transcript 授权 session 记录。
+
+**⚠️ OAuth scope 累积坑**：飞书 OAuth **不允许用 `--scope` 缩窄 token**。新 token 的 scope = `历史累计 ∪ 本次请求`——哪怕这次只请求 3 条，之前授过的都会被继承。真要缩范围：
+
+```bash
+lark-cli auth logout                             # 先撤销现有 token
+# 去开放平台后台把应用声明里不需要的 scope 删掉
+lark-cli auth login --scope "<小集合>"           # 再重新授权
+```
+
+**权限审核层级（开放平台后台）：**
+- "免审权限"勾上即时生效
+- "需审核权限"（如 transcript 导出）走**应用管理员在企业管理后台审批**——自建应用管理员通常就是应用创建者本人，自己批一下即可，**不是**飞书平台人工审，不用等
+
+**辅助命令：**
+```bash
+lark-cli auth scopes                            # 列出当前应用可申请的所有 scope
+lark-cli auth check --scope "<scope>"           # 验证当前 token 是否包含某个 scope
 ```
 
 ### 登录状态
@@ -317,6 +381,71 @@ jq --arg H "$TARGET_OU" --arg M "$MY_OU" '
 
 **别忘了代号/别名**：同事群里经常用数字代号 / 表情符号 / 昵称 / 英文名缩写互称（代号化后真名在群里出现频率大幅下降）。**光搜真名会漏一半信号**。Step 1 之前 / Step 4 分析时一定要**问用户这个人在相关群里有没有别称**，加进过滤词。
 
+### 会议转录拉取（vc / minutes）
+
+飞书会议的逐字稿由妙记（Minutes）产品托管，通过 `vc` 命名空间的三个命令索引到。人物画像里"线下尾巴"的核心数据源——**群里的人是他愿意让你看的形象，会议里才漏尾巴**。
+
+**前置：scope 必须齐全。** 三个妙记 scope 缺一个 `vc +notes` 就会 403：`minutes:minutes:readonly` / `minutes:minutes.artifacts:read` / `minutes:minutes.transcript:export`。详见本文件"前置准备"的 auth 章节。
+
+**三步链路：**
+
+```bash
+# === Step 1: 搜会议 ===
+# 按参会人 + 时间范围找会议（人物路径的典型用法）
+lark-cli vc +search \
+  --participant-ids "<ou_target>" \
+  --start "2026-03-01" \
+  --end "2026-04-23" \
+  --page-size 15 --format json \
+  | jq '.data.meetings[] | {minute_token, title, start_time, duration}'
+# 返回：title / minute_token / start_time / duration
+# 也支持 --query <关键词>, --organizer-ids <ou>, --room-ids <room>
+# 注意：--participant-ids 可传 "me" 代表当前用户
+
+# === Step 2: meeting_id → minute_token (如果上一步已给 minute_token 可跳) ===
+# 少数场景从 meeting_id 或 calendar_event_id 出发时才用
+lark-cli vc +recording \
+  --meeting-ids "<meeting_id>" \
+  --format json
+# 也支持 --calendar-event-ids
+
+# === Step 3: 拉 notes (summary + todos + transcript) ===
+lark-cli vc +notes \
+  --minute-tokens "<token1>,<token2>" \
+  --output-dir "tmp/transcripts/<minute_token>/" \
+  --format json
+# Transcript 落盘成 tmp/transcripts/<token>/transcript.txt（不是内联返回）
+# JSON 返回索引：note_doc_token（AI 笔记 docx）/ verbatim_doc_token（逐字稿 docx）/ artifacts.transcript_file（本次下载的路径）
+# --output-dir 强制指定输出目录——不给会污染 CWD（见下面"安全边界"段）
+# 批量：逗号分隔 tokens，单次最多 N 个（首次实测时确认）
+```
+
+**Transcript 文件格式** (`transcript.txt`)：
+
+```
+<ISO 时间>|<总时长>
+
+关键词:
+<AI 抽取的关键词>
+
+<说话人英文名>(<说话人中文名>) HH:MM:SS.ms 
+<发言内容，原始逐字，含填充词/打断/重复>
+
+<下一位说话人> HH:MM:SS.ms 
+...
+```
+
+**关键坑：**
+- **说话人是 display name，不是 open_id**。要严谨归属到 `persons/<X>.md` 得先 `contact +search-user --query "<中文名>"` 解析，避免同名误伤
+- **`--output-dir` 必须显式给**。不给会落在 CWD 创建一个 `artifact-<title>-<token>/` 目录，污染仓库根。统一用 `tmp/transcripts/<minute_token>/`（`tmp/` 已 gitignore）
+- **Skill 用完即删**。comm-brief 的 Step 9 要清理本次处理的 `tmp/transcripts/<token>/`，transcript 不做本地持久化
+- **长会议 token 成本高**。1 小时的会议 transcript 约 10-30K tokens——让用户挑场次（AskUserQuestion），不要自动全量拉
+
+**什么时候用（comm-brief 人物路径的数据源选择）：**
+- 默认只拉消息即可
+- 用户想看"完整画像" / 关心"线下尾巴" / 明确说"从最近那场会看 X 的表现" → 加会议转录这条路径
+- 群路径（给群做画像）**不走转录**——转录是个人行为数据，不是群结构数据
+
 ### 其他已验证 shortcut（文档/日历等顺带记录）
 
 ```bash
@@ -375,8 +504,8 @@ lark-cli api GET /open-apis/im/v1/messages \
 | 现象 | 处理 |
 |---|---|
 | `lark-cli: command not found` | `npm install -g @larksuite/cli` |
-| `not authenticated` / `401` | `lark-cli auth login --recommend` |
-| `403 / permission denied` | `lark-cli auth check --scope "<scope>"` 确认，缺的用 `lark-cli auth login --scope "<scope>"` 重新授权 |
+| `not authenticated` / `401` | 参考"首次配置"的最小 scope 集，跑 `lark-cli auth login --scope "<完整列表>"` |
+| `403 / permission denied` / `missing_scope` | `lark-cli auth check --scope "<scope>"` 确认缺什么；缺的补进 scope 字符串重跑 `auth login`。注意 OAuth **累积**，新 token 会带上历史 scope |
 | `429` 限流 | 等几秒重试；多次出现缩小 `page_size` |
 | JSON 解析失败 | 把原始输出贴给用户看，**不要假装拿到了结构化数据** |
 | Shortcut 不认 | 用 `lark-cli api` 直接走原始 API |
